@@ -59,7 +59,7 @@ def _slice_at_z(mesh: trimesh.Trimesh, z: float) -> list[Polygon]:
         return []
 
     try:
-        planar, _transform = section.to_planar()
+        planar, _transform = section.to_2D() if hasattr(section, 'to_2D') else section.to_planar()
     except Exception:
         return []
 
