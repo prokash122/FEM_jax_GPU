@@ -754,6 +754,20 @@ def write_gcode(toolpaths, config, output_path):
 # 9. CLI
 # =============================================================================
 
+def _create_demo_mesh(shape: str = "cube") -> trimesh.Trimesh:
+    """Create a built-in demo geometry for testing."""
+    if shape == "cube":
+        return trimesh.creation.box(extents=[20, 20, 20])
+    elif shape == "cylinder":
+        return trimesh.creation.cylinder(radius=10, height=20, sections=64)
+    elif shape == "sphere":
+        return trimesh.creation.icosphere(subdivisions=3, radius=10)
+    elif shape == "cone":
+        return trimesh.creation.cone(radius=10, height=20, sections=64)
+    else:
+        return trimesh.creation.box(extents=[20, 20, 20])
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="DIW Continuous Print G-code Generator\n"
@@ -765,8 +779,12 @@ def main():
                "  python diw_continuous_print.py model.stl --infill-pattern spiral --infill-density 0.6\n",
     )
 
-    parser.add_argument("input", help="Input STL file")
+    parser.add_argument("input", nargs="?", default=None,
+                        help="Input STL file (omit to use built-in demo geometry)")
     parser.add_argument("-o", "--output", default="output.gcode", help="Output G-code file (default: output.gcode)")
+    parser.add_argument("--demo", choices=["cube", "cylinder", "sphere", "cone"],
+                        default=None,
+                        help="Use a built-in demo geometry instead of an STL file")
 
     g = parser.add_argument_group("Geometry")
     g.add_argument("--layer-height", type=float, default=0.4, help="Layer height mm (default: 0.4)")
@@ -813,8 +831,19 @@ def main():
     print("DIW Continuous Print G-code Generator")
     print("=" * 50)
 
-    print(f"\nLoading: {args.input}")
-    mesh = load_mesh(args.input)
+    # Load or generate mesh
+    if args.input:
+        print(f"\nLoading: {args.input}")
+        mesh = load_mesh(args.input)
+    elif args.demo:
+        print(f"\nGenerating demo geometry: {args.demo}")
+        mesh = _create_demo_mesh(args.demo)
+    else:
+        print("\nNo STL file provided. Using demo cube (20x20x20 mm).")
+        print("Tip: python diw_continuous_print.py your_model.stl -o output.gcode")
+        print("     python diw_continuous_print.py --demo cylinder -o output.gcode\n")
+        mesh = _create_demo_mesh("cube")
+
     mesh = prepare_mesh(mesh)
 
     print(f"\nSlicing (layer height={config.layer_height}mm)...")
