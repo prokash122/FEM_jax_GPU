@@ -808,6 +808,18 @@ def main():
     g.add_argument("--infill-angle", type=float, default=45.0, help="Initial infill angle deg (default: 45)")
     g.add_argument("--no-optimize", action="store_true", help="Disable path optimization")
 
+    g = parser.add_argument_group("Verification & Visualization")
+    g.add_argument("--verify", type=str, default=None,
+                   help="Verify an existing G-code file (skip generation)")
+    g.add_argument("--plot", action="store_true",
+                   help="Show 2D layer-by-layer plot of toolpath")
+    g.add_argument("--plot3d", action="store_true",
+                   help="Show full 3D toolpath plot")
+    g.add_argument("--plot-layer", type=int, default=None,
+                   help="Plot a specific layer number (0-indexed)")
+    g.add_argument("--save-plot", type=str, default=None,
+                   help="Save plot image to file (e.g. toolpath.png)")
+
     args = parser.parse_args()
 
     config = PrintConfig(
@@ -858,8 +870,347 @@ def main():
     print(f"\nWriting G-code...")
     write_gcode(toolpaths, config, args.output)
 
+    # Auto-verify the generated G-code
+    verify_gcode(args.output)
+
+    # Visualization
+    if args.plot or args.plot3d or args.plot_layer is not None or args.save_plot:
+        _visualize(toolpaths, args)
+
     print("\nDone!")
 
 
+# =============================================================================
+# 10. G-CODE VERIFIER
+# =============================================================================
+
+def verify_gcode(gcode_path: str) -> bool:
+    """Parse and verify a G-code file. Prints detailed report."""
+    try:
+        with open(gcode_path, 'r') as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        print(f"ERROR: File not found: {gcode_path}")
+        return False
+
+    print(f"\n{'=' * 50}")
+    print(f"G-CODE VERIFICATION: {gcode_path}")
+    print(f"{'=' * 50}")
+
+    # Parse all moves
+    moves = []
+    current_x = current_y = current_z = current_e = 0.0
+    current_f = 0.0
+    layer_count = 0
+    line_count = len(lines)
+    travel_moves = 0
+    print_moves = 0
+    total_travel_dist = 0.0
+    total_print_dist = 0.0
+    travel_segments = []  # for continuity check
+    e_values = []
+    z_values = set()
+    max_x = max_y = max_z = -float('inf')
+    min_x = min_y = float('inf')
+    min_z = float('inf')
+    errors = []
+    warnings = []
+
+    for line_num, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith(';'):
+            if '; --- Layer' in line:
+                layer_count += 1
+            continue
+
+        parts = line.split(';')[0].strip().split()
+        if not parts:
+            continue
+
+        cmd = parts[0]
+
+        # Parse coordinates
+        x = y = z = e = f = None
+        for p in parts[1:]:
+            try:
+                if p[0] == 'X':
+                    x = float(p[1:])
+                elif p[0] == 'Y':
+                    y = float(p[1:])
+                elif p[0] == 'Z':
+                    z = float(p[1:])
+                elif p[0] == 'E':
+                    e = float(p[1:])
+                elif p[0] == 'F':
+                    f = float(p[1:])
+            except (ValueError, IndexError):
+                pass
+
+        if cmd in ('G0', 'G1'):
+            prev_x, prev_y, prev_z = current_x, current_y, current_z
+
+            if x is not None:
+                current_x = x
+            if y is not None:
+                current_y = y
+            if z is not None:
+                current_z = z
+            if e is not None:
+                current_e = e
+                e_values.append(e)
+            if f is not None:
+                current_f = f
+
+            dx = current_x - prev_x
+            dy = current_y - prev_y
+            dist = math.sqrt(dx * dx + dy * dy)
+
+            if cmd == 'G0' or e is None:
+                # Travel move
+                if dist > 0.01:
+                    travel_moves += 1
+                    total_travel_dist += dist
+                    travel_segments.append({
+                        'line': line_num,
+                        'from': (prev_x, prev_y),
+                        'to': (current_x, current_y),
+                        'dist': dist,
+                    })
+            elif cmd == 'G1' and e is not None:
+                # Print move
+                print_moves += 1
+                total_print_dist += dist
+
+            # Track bounds
+            max_x = max(max_x, current_x)
+            max_y = max(max_y, current_y)
+            max_z = max(max_z, current_z)
+            min_x = min(min_x, current_x)
+            min_y = min(min_y, current_y)
+            min_z = min(min_z, current_z)
+
+            if current_z > 0:
+                z_values.add(round(current_z, 3))
+
+            moves.append({
+                'cmd': cmd, 'x': current_x, 'y': current_y,
+                'z': current_z, 'e': current_e, 'line': line_num,
+            })
+
+    # Validate E values (should be monotonically increasing for absolute mode)
+    if e_values:
+        for i in range(1, len(e_values)):
+            if e_values[i] < e_values[i - 1] - 0.001:
+                errors.append(f"E value decreased at step {i}: {e_values[i-1]:.3f} -> {e_values[i]:.3f}")
+                break
+
+    # Check for excessively long travel moves
+    long_travels = [t for t in travel_segments if t['dist'] > 20.0]
+    if long_travels:
+        warnings.append(f"{len(long_travels)} travel moves longer than 20mm (max: {max(t['dist'] for t in long_travels):.1f}mm)")
+
+    # Print report
+    print(f"\n--- File Info ---")
+    print(f"Total lines:      {line_count}")
+    print(f"G-code commands:  {len(moves)}")
+    print(f"Layers:           {layer_count}")
+
+    print(f"\n--- Print Bounds ---")
+    if moves:
+        print(f"X range: {min_x:.2f} to {max_x:.2f} mm (width: {max_x - min_x:.2f})")
+        print(f"Y range: {min_y:.2f} to {max_y:.2f} mm (depth: {max_y - min_y:.2f})")
+        print(f"Z range: {min_z:.2f} to {max_z:.2f} mm (height: {max_z - min_z:.2f})")
+
+    print(f"\n--- Move Statistics ---")
+    print(f"Print moves:      {print_moves}")
+    print(f"Travel moves:     {travel_moves}")
+    print(f"Print distance:   {total_print_dist:.1f} mm")
+    print(f"Travel distance:  {total_travel_dist:.1f} mm")
+    if total_print_dist > 0:
+        ratio = total_travel_dist / total_print_dist * 100
+        print(f"Travel ratio:     {ratio:.1f}%")
+        if ratio < 5:
+            print(f"                  EXCELLENT - near continuous")
+        elif ratio < 10:
+            print(f"                  GOOD - mostly continuous")
+        elif ratio < 20:
+            print(f"                  FAIR - some discontinuities")
+        else:
+            print(f"                  POOR - many discontinuities")
+
+    print(f"\n--- Continuity Analysis ---")
+    print(f"Total travel segments:  {travel_moves}")
+    if travel_segments:
+        dists = [t['dist'] for t in travel_segments]
+        print(f"Shortest travel:        {min(dists):.2f} mm")
+        print(f"Longest travel:         {max(dists):.2f} mm")
+        print(f"Average travel:         {sum(dists)/len(dists):.2f} mm")
+
+    if e_values:
+        print(f"\n--- Extrusion ---")
+        print(f"Final E value:    {e_values[-1]:.2f} mm")
+        print(f"E always increasing: {'YES' if not any('E value' in e for e in errors) else 'NO'}")
+
+    # Errors and warnings
+    if errors:
+        print(f"\n--- ERRORS ({len(errors)}) ---")
+        for e in errors:
+            print(f"  ERROR: {e}")
+
+    if warnings:
+        print(f"\n--- WARNINGS ({len(warnings)}) ---")
+        for w in warnings:
+            print(f"  WARN: {w}")
+
+    if not errors:
+        print(f"\n  RESULT: G-code looks VALID")
+    else:
+        print(f"\n  RESULT: G-code has ISSUES - review errors above")
+
+    return len(errors) == 0
+
+
+# =============================================================================
+# 11. VISUALIZATION
+# =============================================================================
+
+def _visualize(toolpaths, args):
+    """Plot toolpath visualization."""
+    import matplotlib
+    matplotlib.use('Agg') if args.save_plot and not (args.plot or args.plot3d) else None
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    if args.plot_layer is not None:
+        # Single layer plot
+        idx = args.plot_layer
+        if idx < 0 or idx >= len(toolpaths):
+            print(f"Layer {idx} out of range (0-{len(toolpaths)-1})")
+            return
+        _plot_single_layer(toolpaths[idx], plt, Line2D, args)
+
+    elif args.plot3d:
+        _plot_3d(toolpaths, plt, args)
+
+    elif args.plot:
+        # Plot first, middle, last layers
+        indices = [0]
+        if len(toolpaths) > 2:
+            indices.append(len(toolpaths) // 2)
+        if len(toolpaths) > 1:
+            indices.append(len(toolpaths) - 1)
+
+        fig, axes = plt.subplots(1, len(indices), figsize=(6 * len(indices), 6))
+        if len(indices) == 1:
+            axes = [axes]
+
+        labels = ["First Layer", "Middle Layer", "Last Layer"]
+        for ax, idx, label in zip(axes, indices, labels):
+            tp = toolpaths[idx]
+            for seg in tp.segments:
+                pts = seg.points
+                if len(pts) < 2:
+                    continue
+                color = {'perimeter': 'blue', 'infill': 'green', 'travel': 'red'}.get(seg.segment_type, 'gray')
+                lw = 0.5 if seg.segment_type == 'travel' else 1.2
+                ax.plot(pts[:, 0], pts[:, 1], color=color, linewidth=lw)
+            ax.set_aspect('equal')
+            ax.grid(True, alpha=0.3)
+            ax.set_title(f"{label} (Z={tp.z_height:.2f}mm)\n"
+                        f"travel={tp.travel_distance:.1f}mm")
+            ax.set_xlabel("X (mm)")
+            ax.set_ylabel("Y (mm)")
+
+        legend_elements = [
+            Line2D([0], [0], color='blue', lw=1.5, label='Perimeter'),
+            Line2D([0], [0], color='green', lw=1.0, label='Infill'),
+            Line2D([0], [0], color='red', lw=0.5, label='Travel'),
+        ]
+        axes[-1].legend(handles=legend_elements, loc='upper right')
+        plt.suptitle("DIW Continuous Print - Toolpath Preview", fontsize=14)
+        plt.tight_layout()
+
+        if args.save_plot:
+            plt.savefig(args.save_plot, dpi=150)
+            print(f"Plot saved to: {args.save_plot}")
+        else:
+            plt.show()
+
+
+def _plot_single_layer(tp, plt, Line2D, args):
+    fig, ax = plt.subplots(figsize=(10, 10))
+    for seg in tp.segments:
+        pts = seg.points
+        if len(pts) < 2:
+            continue
+        color = {'perimeter': 'blue', 'infill': 'green', 'travel': 'red'}.get(seg.segment_type, 'gray')
+        lw = 0.5 if seg.segment_type == 'travel' else 1.5
+        ax.plot(pts[:, 0], pts[:, 1], color=color, linewidth=lw)
+
+        # Draw direction arrows on print segments
+        if seg.segment_type != 'travel' and len(pts) > 4:
+            mid = len(pts) // 2
+            dx = pts[mid + 1, 0] - pts[mid, 0]
+            dy = pts[mid + 1, 1] - pts[mid, 1]
+            ax.annotate('', xy=(pts[mid + 1, 0], pts[mid + 1, 1]),
+                       xytext=(pts[mid, 0], pts[mid, 1]),
+                       arrowprops=dict(arrowstyle='->', color=color, lw=1.5))
+
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    ax.set_title(f"Layer Z={tp.z_height:.2f}mm | "
+                f"print={tp.print_distance:.1f}mm | "
+                f"travel={tp.travel_distance:.1f}mm")
+    ax.set_xlabel("X (mm)")
+    ax.set_ylabel("Y (mm)")
+
+    legend_elements = [
+        Line2D([0], [0], color='blue', lw=1.5, label='Perimeter'),
+        Line2D([0], [0], color='green', lw=1.0, label='Infill'),
+        Line2D([0], [0], color='red', lw=0.5, label='Travel'),
+    ]
+    ax.legend(handles=legend_elements)
+    plt.tight_layout()
+
+    if args.save_plot:
+        plt.savefig(args.save_plot, dpi=150)
+        print(f"Plot saved to: {args.save_plot}")
+    else:
+        plt.show()
+
+
+def _plot_3d(toolpaths, plt, args):
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection='3d')
+
+    for tp in toolpaths:
+        z = tp.z_height
+        for seg in tp.segments:
+            pts = seg.points
+            if len(pts) < 2:
+                continue
+            zs = np.full(len(pts), z)
+            color = {'perimeter': 'blue', 'infill': 'green', 'travel': 'red'}.get(seg.segment_type, 'gray')
+            alpha = 0.3 if seg.segment_type == 'travel' else 0.7
+            lw = 0.2 if seg.segment_type == 'travel' else 0.5
+            ax.plot(pts[:, 0], pts[:, 1], zs, color=color, linewidth=lw, alpha=alpha)
+
+    ax.set_xlabel("X (mm)")
+    ax.set_ylabel("Y (mm)")
+    ax.set_zlabel("Z (mm)")
+    ax.set_title(f"DIW Continuous Print - 3D View ({len(toolpaths)} layers)")
+    plt.tight_layout()
+
+    if args.save_plot:
+        plt.savefig(args.save_plot, dpi=150)
+        print(f"3D plot saved to: {args.save_plot}")
+    else:
+        plt.show()
+
+
 if __name__ == "__main__":
-    main()
+    # If called with --verify, just verify an existing gcode file
+    if len(sys.argv) >= 3 and sys.argv[1] == '--verify':
+        verify_gcode(sys.argv[2])
+    else:
+        main()
