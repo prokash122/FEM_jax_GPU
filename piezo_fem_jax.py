@@ -73,12 +73,12 @@ print("=" * 60)
 # ============================================================
 
 # Geometry [m]
-Lx = 0.01   # 10 mm
-Ly = 0.005  # 5 mm
-Lz = 0.002  # 2 mm (thickness along polarization)
+Lx = 0.06   # 60 mm
+Ly = 0.06   # 60 mm
+Lz = 0.01   # 10 mm (thickness along polarization)
 
 # Mesh divisions
-nx, ny, nz = 20, 10, 6
+nx, ny, nz = 12, 12, 4
 
 print(f"\nGeometry: {Lx*1e3:.1f} x {Ly*1e3:.1f} x {Lz*1e3:.1f} mm")
 print(f"Mesh: {nx} x {ny} x {nz} = {nx*ny*nz} elements")
